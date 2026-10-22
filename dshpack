@@ -7,6 +7,7 @@
 #   dshpack verify <bundle.tar.zst|bundle.run>
 #   dshpack restore <bundle.tar.zst|bundle.run> [--fresh] [--pkgs] [--dry-run]
 #   dshpack selfextract <bundle.tar.zst> [-o OUT.run]   生成单文件自解压安装包
+#   dshpack serve [dir] [port]      局域网 HTTP 分发（终端出网址 + 二维码）
 #   dshpack info
 #
 # 设计要点：
@@ -410,6 +411,59 @@ HEAD
   rm -f "$out.sha256"; sha256sum "$out" > "$out.sha256"
 }
 
+cmd_serve() {
+  local dir="${1:-$HOME_DIR/dshpack-out}" port="${2:-8899}"
+  [ -d "$dir" ] || die "目录不存在: $dir"
+  need node
+  local qr="$HOME_DIR/.dshpj/assets/qrcode.js"
+  DSHPACK_SERVE_DIR="$(cd "$dir" && pwd)" DSHPACK_SERVE_PORT="$port" DSHPACK_QR="$qr" \
+  node --input-type=commonjs - <<'NODEEOF'
+const http=require('http'),fs=require('fs'),path=require('path'),os=require('os'),crypto=require('crypto');
+const DIR=process.env.DSHPACK_SERVE_DIR, PORT=+process.env.DSHPACK_SERVE_PORT, QR=process.env.DSHPACK_QR;
+const lan=()=>{for(const [n,as] of Object.entries(os.networkInterfaces())) for(const a of as||[]) if(a.family==='IPv4'&&!a.internal) return a.address; return '127.0.0.1';};
+const ip=lan(), url=`http://${ip}:${PORT}/`;
+const human=b=>b>1073741824?(b/1073741824).toFixed(2)+'G':b>1048576?(b/1048576).toFixed(1)+'M':(b/1024).toFixed(0)+'K';
+const list=()=>fs.readdirSync(DIR).filter(f=>!f.startsWith('.')).map(f=>{const st=fs.statSync(path.join(DIR,f));return {f,size:st.size,mt:st.mtime};});
+const page=()=>`<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>dshpack serve</title>
+<style>body{font:15px/1.5 system-ui,-apple-system,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:24px}
+h1{font-size:18px;font-weight:600;margin:0 0 4px}p.sub{color:#8a8f98;margin:0 0 20px;font-size:13px}
+a{color:#7cc4ff;text-decoration:none}a:hover{text-decoration:underline}
+li{list-style:none;padding:10px 12px;border:1px solid #23262d;border-radius:10px;margin-bottom:8px;display:flex;justify-content:space-between;gap:12px}
+li span.s{color:#8a8f98;font-size:12px;white-space:nowrap}code{background:#1a1d23;padding:2px 6px;border-radius:6px;font-size:12px}
+.wrap{max-width:760px;margin:0 auto}pre{background:#1a1d23;padding:12px;border-radius:10px;overflow:auto;font-size:12px}</style>
+<div class=wrap><h1>dshpack</h1><p class=sub>${DIR} · ${ip}:${PORT} · 新机上直接执行下面的命令</p>
+<ul>${list().map(e=>`<li><a href="/${encodeURIComponent(e.f)}">${e.f}</a><span class=s>${human(e.size)}</span></li>`).join('')}</ul>
+<p class=sub>sha256 校验文件在 <code>*.sha256</code> 旁边。</p>
+<pre>pkg install -y nodejs-lts tar zstd
+curl -fsSL ${url}dshpack -o $PREFIX/bin/dshpack && chmod +x $PREFIX/bin/dshpack
+curl -fLO ${url}dshpack-LE2120-arm64-std-20261022-1858.run</pre></div>`;
+const server=http.createServer((req,res)=>{
+  const u=decodeURIComponent((req.url||'/').split('?')[0]);
+  if(u==='/'){const b=Buffer.from(page());res.writeHead(200,{'content-type':'text/html; charset=utf-8','content-length':b.length});return res.end(b);}
+  const f=path.join(DIR,path.basename(u));
+  if(!fs.existsSync(f)||!fs.statSync(f).isFile()){res.writeHead(404);return res.end('not found');}
+  const size=fs.statSync(f).size, range=req.headers.range;
+  console.log(`[serve] ${new Date().toISOString().slice(11,19)} ${req.socket.remoteAddress} ${path.basename(u)} ${range||''}`);
+  if(range){const m=/bytes=(\d*)-(\d*)/.exec(range)||[];const start=m[1]?+m[1]:0;const end=m[2]?+m[2]:size-1;
+    res.writeHead(206,{'content-type':'application/octet-stream','accept-ranges':'bytes','content-range':`bytes ${start}-${end}/${size}`,'content-length':end-start+1});
+    return fs.createReadStream(f,{start,end}).pipe(res);}
+  res.writeHead(200,{'content-type':'application/octet-stream','accept-ranges':'bytes','content-length':size});
+  fs.createReadStream(f).pipe(res);
+});
+server.listen(PORT,'0.0.0.0',()=>{
+  console.log(`[serve] ${DIR}`);
+  console.log(`[serve] ${url}`);
+  try{const Q=require(QR);const c=Q(0,'M');c.addData(url);c.make();const n=c.getModuleCount();
+    const pad=2,B='\u2588\u2588',W='  ';let out='';
+    for(let r=-pad;r<n+pad;r++){let line='';for(let col=-pad;col<n+pad;col++){
+      const dark=(r>=0&&col>=0&&r<n&&col<n)?c.isDark(r,col):false;line+=dark?B:W;}out+=line+'\n';}
+    process.stdout.write(out);
+  }catch(e){console.log('(二维码不可用: '+e.message+')');}
+  console.log('[serve] Ctrl-C 停止');
+});
+NODEEOF
+}
+
 cmd_info() {
   echo "dshpack $VERSION"
   echo "  PREFIX      : $PREFIX"
@@ -430,6 +484,7 @@ case "${1:-}" in
   verify)  shift; cmd_verify "$@";;
   restore) shift; cmd_restore "$@";;
   selfextract|run) shift; cmd_selfextract "$@";;
+  serve) shift; cmd_serve "$@";;
   info)    shift; cmd_info "$@";;
   -h|--help|help|"") usage;;
   *) die "未知子命令: $1（用 dshpack --help）";;
