@@ -81,6 +81,36 @@ zstd -dc dshpack-*.tar.zst | tar -xf - && cd dshpack-*/
 sha256sum -c CHECKSUMS.sha256 && bash RESTORE.sh --pkgs
 ```
 
+## 让 AI 代理（opencode）去装
+
+新机上只有 opencode、连 node 都没有也没关系：`agents/` 里有给代理看的部署手册。
+
+```bash
+# 旧机：开局域网分发，打印网址 + 终端二维码
+dshpack serve                 # → http://<旧机IP>:8899/
+
+# 新机
+mkdir -p ~/dsh-deploy && cd ~/dsh-deploy
+curl -fsSL https://raw.githubusercontent.com/zoujiapeng/dshpack/main/agents/AGENTS.md -o AGENTS.md
+curl -fsSL https://raw.githubusercontent.com/zoujiapeng/dshpack/main/agents/bootstrap.sh -o bootstrap.sh
+opencode
+```
+
+然后对 opencode 说：
+
+> 读 AGENTS.md，按它把 dsh + dshpj 装到本机，并从
+> `http://<旧机IP>:8899/dshpack-xxx.run` 还原。每一步都真跑，把真实输出贴给我。
+
+不想让代理读文件，直接给它一句：
+
+> 执行 `bash <(curl -fsSL https://raw.githubusercontent.com/zoujiapeng/dshpack/main/agents/bootstrap.sh)`
+> 装上 dsh + dshpj，然后贴出 `node -v`、`dsh --version`、`dshpack info` 的真实输出。
+
+`agents/bootstrap.sh` 自己做：`pkg install` 前置包 → `npm i -g @deepseek-ai/dsh@0.2.0-rc.2`
+→ dshpj 补丁栈 → dshpack → 可选 `--bundle` 还原 → 打印自检。幂等，重复跑只补缺的部分。
+话术模板与回退策略见 [agents/PROMPT.md](agents/PROMPT.md)，代理规则见
+[agents/AGENTS.md](agents/AGENTS.md)。
+
 ## 新机前置（一次性）
 
 ```bash
