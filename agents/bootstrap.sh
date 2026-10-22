@@ -33,15 +33,15 @@ done
 REPO_SLUG="zoujiapeng/dshpack"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 
-# fetch_gh <包内路径> <目标文件>
+# fetch_gh <owner/repo> <包内路径> <目标文件>
 # 三级回退：raw.githubusercontent.com -> git clone --depth 1 -> api.github.com contents(base64)
 # 手机上 GitHub 的三个入口经常只有一个能通，写死单一路径的脚本在这里会假失败。
 fetch_gh() {
-  local path="$1" dest="$2" code
-  say "下载 $path"
+  local slug="${1:-$REPO_SLUG}" path="$2" dest="$3" code
+  say "下载 $slug/$path"
   for i in 1 2 3; do
     if curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 20 -m 120 \
-        "https://raw.githubusercontent.com/$REPO_SLUG/$REPO_BRANCH/$path" -o "$dest" 2>/dev/null; then
+        "https://raw.githubusercontent.com/$slug/$REPO_BRANCH/$path?cb=$(date +%s)" -o "$dest" 2>/dev/null; then
       ok "raw 成功（第 $i 次）"; return 0
     fi
     sleep 2
@@ -50,7 +50,7 @@ fetch_gh() {
   for i in 1 2 3; do
     code=$(curl -s -m 60 -o "$dest.json" -w '%{http_code}' \
       -H 'Accept: application/vnd.github+json' \
-      "https://api.github.com/repos/$REPO_SLUG/contents/$path?ref=$REPO_BRANCH" 2>/dev/null || echo 000)
+      "https://api.github.com/repos/$slug/contents/$path?ref=$REPO_BRANCH" 2>/dev/null || echo 000)
     if [ "$code" = 200 ]; then
       node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));fs.writeFileSync(process.argv[2],Buffer.from(j.content,"base64"))' "$dest.json" "$dest"
       rm -f "$dest.json"; ok "api 成功（第 $i 次）"; return 0
@@ -60,7 +60,7 @@ fetch_gh() {
   say "api 也不通，尝试 git clone --depth 1"
   local tmp="$PREFIX/tmp/dshpack-clone.$$"
   rm -rf "$tmp"
-  if git clone -q --depth 1 "https://github.com/$REPO_SLUG" "$tmp" 2>/dev/null && [ -f "$tmp/$path" ]; then
+  if git clone -q --depth 1 "https://github.com/$slug" "$tmp" 2>/dev/null && [ -f "$tmp/$path" ]; then
     cp "$tmp/$path" "$dest"; rm -rf "$tmp"; ok "clone 成功"; return 0
   fi
   rm -rf "$tmp"
@@ -114,11 +114,8 @@ if [ "$MINIMAL" = 0 ]; then
   if [ -f "$HOME_DIR/.dshpj/assets/patch.yml" ]; then
     ok "已存在 ~/.dshpj/assets/patch.yml，跳过"
   else
-    if curl -fsSL --retry 3 --connect-timeout 20 -m 120 "$DSHPJ_REPO/bootstrap.sh" -o "$PREFIX/tmp/dshpj-bootstrap.sh"; then
-      ok "dshpj bootstrap.sh 下载成功"
-    else
-      die "下载 dshpj bootstrap.sh 失败：raw/api/clone 都不通，见 AGENTS.md 的网络回退"
-    fi
+    fetch_gh "zoujiapeng/dshpj-installer" "bootstrap.sh" "$PREFIX/tmp/dshpj-bootstrap.sh" \
+      || die "下载 dshpj bootstrap.sh 失败（raw/api/clone 三级回退都失败）"
     bash "$PREFIX/tmp/dshpj-bootstrap.sh"
     [ -f "$HOME_DIR/.dshpj/assets/patch.yml" ] && ok "补丁栈就绪" || die "dshpj 安装后仍找不到 patch.yml"
   fi
@@ -128,7 +125,7 @@ fi
 
 # ---------------------------------------------------------------- 4. dshpack ---
 say "4/5 安装 dshpack"
-fetch_gh "dshpack" "$PREFIX/bin/dshpack" || die "下载 dshpack 失败（raw/api/clone 三级回退都失败）"
+fetch_gh "$REPO_SLUG" "dshpack" "$PREFIX/bin/dshpack" || die "下载 dshpack 失败（raw/api/clone 三级回退都失败）"
 chmod 755 "$PREFIX/bin/dshpack"
 ok "dshpack $("$PREFIX/bin/dshpack" info | head -1 | awk '{print $2}')"
 
