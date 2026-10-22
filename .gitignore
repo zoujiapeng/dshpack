@@ -1,0 +1,5 @@
+dshpack-out/
+*.tar.zst
+*.tar.zst.sha256
+*.run
+*.bak-*

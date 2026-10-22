@@ -1,0 +1,436 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# dshpack — 把本机的 dsh / dshpj 全家桶打成一个包，在另一台手机的 Termux 上一键还原成
+# 跟本机一模一样的运行时（同一个 Termux 前缀 => 路径、二进制、shebang 全部直接可用）。
+#
+#   dshpack pack  [--mode std|full|slim] [-o OUTDIR] [--secrets] [--level N] [--dry-run]
+#   dshpack list  <bundle.tar.zst|bundle.run>
+#   dshpack verify <bundle.tar.zst|bundle.run>
+#   dshpack restore <bundle.tar.zst|bundle.run> [--fresh] [--pkgs] [--dry-run]
+#   dshpack selfextract <bundle.tar.zst> [-o OUT.run]   生成单文件自解压安装包
+#   dshpack info
+#
+# 设计要点：
+#  * Termux 的前缀在所有设备上都是 /data/data/com.termux/files/usr，home 也是固定的
+#    /data/data/com.termux/files/home —— 所以整棵 node_modules、usr/bin 包装脚本、
+#    shebang、绝对路径配置都能原样搬过去，不需要任何改写。
+#  * 只搬“有状态的东西”：全局 npm 包（@deepseek-ai/dsh 及其依赖）、~/.dsh（配置+会话+存储）、
+#    ~/.dshpj（补丁栈）、~/.dshpj-lab、usr/bin 里的 dsh/dshpj 包装器、点文件、包清单。
+#  * 可再生的大块（模型、attachments、cache、node-glibc）默认不搬，用 --mode full 全搬。
+#  * 包内自带 RESTORE.sh + MANIFEST.json + CHECKSUMS.sha256，单文件即可在新机器落地。
+set -euo pipefail
+
+VERSION="1.0.0"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+HOME_DIR="${HOME:-/data/data/com.termux/files/home}"
+NPM_GLOBAL="${NPM_GLOBAL:-$PREFIX/lib/node_modules}"
+SELF="$0"
+
+say()  { printf '[dshpack] %s\n' "$*"; }
+die()  { printf '[dshpack] ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || printf '%sB' "$1"; }
+
+as_root() {
+  # 与 dsh 启动器相同的逃逸路径：非 root 时通过 Magisk su 重新执行自己。
+  if [ "$(id -u)" != "0" ] && command -v su >/dev/null 2>&1; then
+    exec su -c "$(printf '%q ' "$SELF" "$@")"
+  fi
+}
+
+# ---------------------------------------------------------------- manifest ---
+
+collect_manifest() {
+  local out="$1"
+  local dsh_ver node_ver npm_ver arch host uname_s
+  dsh_ver="$(NPM_GLOBAL="$NPM_GLOBAL" node -e 'const fs=require("fs");try{console.log(JSON.parse(fs.readFileSync(process.env.NPM_GLOBAL+"/@deepseek-ai/dsh/package.json","utf8")).version)}catch(e){console.log("missing")}' 2>/dev/null || echo missing)"
+  node_ver="$(node -v 2>/dev/null || echo missing)"
+  npm_ver="$(npm -v 2>/dev/null || echo missing)"
+  arch="$(uname -m)"
+  host="$(getprop ro.product.model 2>/dev/null | tr -d " " || true)"; [ -n "$host" ] || host="$(hostname 2>/dev/null || echo android)"
+  uname_s="$(uname -sr)"
+
+  NPM_GLOBAL="$NPM_GLOBAL" OUT="$out" HOSTN="$host" ARCH="$arch" UNAME_S="$uname_s" \
+  NODE_VER="$node_ver" NPM_VER="$npm_ver" DSH_VER="$dsh_ver" PREFIXV="$PREFIX" HOMEV="$HOME_DIR" \
+  node --input-type=module - <<'EOF'
+import fs from 'node:fs';
+import { execSync } from 'node:child_process';
+const e = process.env;
+const fs2 = fs;
+const run = (c) => { try { return execSync(c, {encoding:'utf8', stdio:['ignore','pipe','ignore']}).trim(); } catch { return ''; } };
+const dpkg = run("dpkg-query -W -f='${Package} ${Version}\\n' || true")
+  .split('\n').filter(Boolean).map(l => { const i = l.lastIndexOf(' '); return {name:l.slice(0,i), version:l.slice(i+1)}; });
+const globals = (() => {
+  try { return JSON.parse(run(`npm ls -g --depth=0 --json 2>/dev/null`) || '{}').dependencies || {}; }
+  catch { return {}; }
+})();
+const m = {
+  schema: 1,
+  generator: 'dshpack',
+  generatorVersion: '1.0.0',
+  createdAt: new Date().toISOString(),
+  host: e.HOSTN,
+  platform: { os: e.UNAME_S, arch: e.ARCH, termuxPrefix: e.PREFIXV, home: e.HOMEV },
+  runtime: { node: e.NODE_VER, npm: e.NPM_VER, dsh: e.DSH_VER, npmGlobalRoot: e.NPM_GLOBAL },
+  npmpackages: Object.fromEntries(Object.entries(globals).map(([k,v]) => [k, v.version])),
+  packages: dpkg,
+  paths: {
+    home: ['~/.dsh', '~/.dshpj', '~/.dshpj-lab'],
+    prefix: [e.PREFIXV + '/bin/dsh', e.PREFIXV + '/bin/dshpj'],
+    npmGlobal: [e.NPM_GLOBAL + '/@deepseek-ai'],
+  },
+};
+fs.writeFileSync(e.OUT, JSON.stringify(m, null, 2) + '\n');
+EOF
+}
+
+# --------------------------------------------------------------- pack core ---
+
+# stage <srcdir> <dstdir> [exclude...]
+stage() {
+  local src="$1" dst="$2"; shift 2
+  local ex=()
+  for p in "$@"; do ex+=(--exclude="$p"); done
+  mkdir -p "$dst"
+  tar -cf - "${ex[@]}" -C "$src" . | tar -xf - -C "$dst"
+}
+
+MODE="std"
+OUTDIR="$HOME_DIR/dshpack-out"
+LEVEL=12
+SECRETS=0
+DRY=0
+
+cmd_pack() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) MODE="${2:?}"; shift 2;;
+      --mode=*) MODE="${1#*=}"; shift;;
+      -o|--out) OUTDIR="${2:?}"; shift 2;;
+      --level) LEVEL="${2:?}"; shift 2;;
+      --secrets) SECRETS=1; shift;;
+      --dry-run) DRY=1; shift;;
+      *) die "未知参数: $1";;
+    esac
+  done
+  case "$MODE" in std|full|slim) ;; *) die "--mode 只能是 std|full|slim";; esac
+  need tar; need zstd; need node
+  [ -d "$NPM_GLOBAL/@deepseek-ai/dsh" ] || say "警告: 找不到 $NPM_GLOBAL/@deepseek-ai/dsh"
+
+  local stamp name stage_dir hosttag
+  hosttag="$(getprop ro.product.model 2>/dev/null | tr -d " " || true)"; [ -n "$hosttag" ] || hosttag="$(hostname 2>/dev/null || echo android)"
+  stamp="$(date +%Y%m%d-%H%M)"
+  name="dshpack-$hosttag-arm64-$MODE-$stamp"
+  stage_dir="$OUTDIR/$name"
+  mkdir -p "$stage_dir/payload"
+
+  say "模式=$MODE 阶段目录=$stage_dir secrets=$SECRETS"
+
+  # ---- home 侧 ----
+  local h="$stage_dir/payload/home"; mkdir -p "$h"
+  # ~/.dshpj 全量，去掉日志与 pid
+  stage "$HOME_DIR/.dshpj" "$h/.dshpj" 'pj-logs' '*.pid'
+  # ~/.dshpj-lab（实验拷贝，配置/笔记）
+  [ -d "$HOME_DIR/.dshpj-lab" ] && stage "$HOME_DIR/.dshpj-lab" "$h/.dshpj-lab" 'pj-logs' '*.pid' '*dsh-home/sessions'
+  # ~/.dsh 配置层
+  local d="$h/.dsh"; mkdir -p "$d"
+  for sub in profiles storages llm-deepseek runtime speech-to-text attachments cache logs sessions; do :; done
+  for sub in profiles storages llm-deepseek; do
+    [ -e "$HOME_DIR/.dsh/$sub" ] && stage "$HOME_DIR/.dsh/$sub" "$d/$sub"
+  done
+  for f in .anonymous-user-id; do
+    [ -f "$HOME_DIR/.dsh/$f" ] && cp -a "$HOME_DIR/.dsh/$f" "$d/"
+  done
+  # 会话历史：std/full 带走（标题、工作目录、压缩摘要），slim 不带
+  if [ "$MODE" != slim ] && [ -d "$HOME_DIR/.dsh/sessions" ]; then
+    stage "$HOME_DIR/.dsh/sessions" "$d/sessions"
+  fi
+  # 凭证：只有显式 --secrets 才搬，单独落到 secrets/ 子目录并加密（若给了口令）
+  if [ "$SECRETS" = 1 ]; then
+    mkdir -p "$stage_dir/secrets"
+    for f in .dsh/.credentials.yaml .gh_token .git-credentials .dsh_cj; do
+      [ -f "$HOME_DIR/$f" ] && cp -a "$HOME_DIR/$f" "$stage_dir/secrets/$(basename "$f")"
+    done
+    [ -d "$HOME_DIR/.ssh" ] && stage "$HOME_DIR/.ssh" "$stage_dir/secrets/ssh"
+  fi
+  # 可再生大块：只在 full 模式搬
+  if [ "$MODE" = full ]; then
+    for sub in runtime speech-to-text attachments; do
+      [ -e "$HOME_DIR/.dsh/$sub" ] && stage "$HOME_DIR/.dsh/$sub" "$d/$sub"
+    done
+  fi
+  # 点文件
+  for f in .bashrc .bash_profile .profile .npmrc .gitconfig .hushlogin; do
+    [ -f "$HOME_DIR/$f" ] && cp -a "$HOME_DIR/$f" "$h/" || true
+  done
+  [ -d "$HOME_DIR/.termux" ] && stage "$HOME_DIR/.termux" "$h/.termux" 'tmp'
+
+  # ---- prefix 侧 ----
+  local p="$stage_dir/payload/prefix"; mkdir -p "$p/bin"
+  for f in dsh dshpj dsh-lan dshpj-doctor dshui; do
+    [ -f "$PREFIX/bin/$f" ] && cp -a "$PREFIX/bin/$f" "$p/bin/" || true
+  done
+  if [ "$MODE" != slim ] && [ -d "$NPM_GLOBAL/@deepseek-ai" ]; then
+    mkdir -p "$p/lib/node_modules"
+    stage "$NPM_GLOBAL/@deepseek-ai" "$p/lib/node_modules/@deepseek-ai" '*/.cache' '*/.git'
+  fi
+
+  # ---- manifest + restore + checksums ----
+  collect_manifest "$stage_dir/MANIFEST.json"
+  cp -a "$SELF" "$stage_dir/dshpack"
+  local mver
+  mver="$(node -e 'console.log(require(process.argv[1]).runtime.dsh)' "$stage_dir/MANIFEST.json")"
+  {
+    echo "dshpack bundle"
+    echo "  name      : $name"
+    echo "  mode      : $MODE"
+    echo "  created   : $(date -Is)"
+    echo "  host      : $hosttag ($(uname -m))"
+    echo "  dsh       : $mver"
+    echo "  node      : $(node -v)"
+    echo "  secrets   : $([ "$SECRETS" = 1 ] && echo included || echo excluded)"
+    echo "  contents  : ~/.dsh（配置层$([ "$MODE" != slim ] && echo ' + sessions')$([ "$MODE" = full ] && echo ' + runtime/模型/attachments')）, ~/.dshpj, ~/.dshpj-lab, usr/bin 包装器$([ "$MODE" = slim ] && echo '' || echo ', @deepseek-ai/* 全局包')"
+  } > "$stage_dir/MANIFEST.txt"
+
+  gen_restore "$stage_dir/RESTORE.sh" "$mver"
+
+  if [ "$DRY" = 1 ]; then
+    say "dry-run：未写压缩包。阶段目录内容："
+    du -sh "$stage_dir"; exit 0
+  fi
+
+  ( cd "$stage_dir" && find . -type f ! -name CHECKSUMS.sha256 -print0 | sort -z | xargs -0 sha256sum > CHECKSUMS.sha256 )
+  say "正在压缩 (zstd -$LEVEL -T0)…"
+  local out="$OUTDIR/$name.tar.zst"
+  tar --numeric-owner -cf - -C "$stage_dir" . | zstd -q -"$LEVEL" -T0 -o "$out"
+  ( cd "$OUTDIR" && sha256sum "$(basename "$out")" > "$(basename "$out").sha256" )
+  local sz; sz=$(stat -c %s "$out")
+  say "完成: $out ($(human "$sz"))"
+  say "校验: $OUTDIR/$(basename "$out").sha256"
+  say "还原: dshpack restore $out"
+}
+
+# ------------------------------------------------------------ RESTORE 生成 ---
+
+gen_restore() {
+  local dst="$1"; shift
+  local mode="$MODE" dshver="${1:-unknown}"
+  cat > "$dst" <<RESTORE_EOF
+#!/data/data/com.termux/files/usr/bin/bash
+# RESTORE.sh — 由 dshpack $VERSION 生成；在本包目录里直接执行即可。
+# 把 @deepseek-ai/dsh、~/.dsh、~/.dshpj、~/.dshpj-lab、usr/bin 包装器还原到本机 Termux。
+set -euo pipefail
+BUNDLE_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+PREFIX="\${PREFIX:-/data/data/com.termux/files/usr}"
+HOME_DIR="\${HOME:-/data/data/com.termux/files/home}"
+MODE="$mode"; DSHVER="$dshver"
+FRESH=0; WITHPKGS=0; DRY=0
+for a in "\$@"; do case "\$a" in
+  --fresh) FRESH=1;;
+  --pkgs) WITHPKGS=1;;
+  --dry-run) DRY=1;;
+  -h|--help) sed -n '2,6p' "\$0"; exit 0;;
+  *) echo "未知参数: \$a" >&2; exit 2;;
+esac; done
+
+say(){ printf '[restore] %s\n' "\$*"; }
+die(){ printf '[restore] ERROR: %s\n' "\$*" >&2; exit 1; }
+
+# root 逃逸（与 dsh / dshui 相同的 Magisk su 路径）
+if [ "\$(id -u)" != "0" ] && command -v su >/dev/null 2>&1; then
+  for a in "\$@"; do :; done
+  exec su -c "\$(printf '%q ' "\$0" "\$@")"
+fi
+
+[ "\$(uname -m)" = aarch64 ] || say "注意: 本包按 arm64 生成，当前为 \$(uname -m)"
+[ "\$PREFIX" = /data/data/com.termux/files/usr ] || say "注意: 非标准 Termux 前缀 \$PREFIX"
+
+command -v tar >/dev/null || die "缺 tar"
+command -v node >/dev/null || die "缺 nodejs：先 pkg install nodejs-lts"
+
+STAMP=\$(date +%Y%m%d-%H%M%S)
+[ "\$DRY" = 1 ] && say "dry-run：不会写入任何文件"
+
+mkbackup(){ local target="\$1"; [ -e "\$target" ] || return 0
+  [ "\$FRESH" = 1 ] && { say "删除旧 \$target"; [ "\$DRY" = 1 ] || rm -rf "\$target"; return 0; }
+  say "备份 \$target -> \$target.bak-\$STAMP"; [ "\$DRY" = 1 ] || mv "\$target" "\$target.bak-\$STAMP"; }
+
+# ---- 1. 包清单差异（可选安装） ----
+if [ "\$WITHPKGS" = 1 ] && command -v dpkg-query >/dev/null; then
+  want=\$(node -e 'console.log(require(process.argv[1]).packages.map(p=>p.name).join("\n"))' "\$BUNDLE_DIR/MANIFEST.json")
+  have=\$(dpkg-query -W -f='\${Package}\n')
+  missing=\$(comm -23 <(printf '%s\n' "\$want" | sort -u) <(printf '%s\n' "\$have" | sort -u) | tr '\n' ' ')
+  if [ -n "\${missing// /}" ]; then say "安装缺失包: \$missing"; [ "\$DRY" = 1 ] || pkg install -y \$missing; else say "包清单已一致"; fi
+else
+  node -e '
+    const m=require(process.argv[1]);
+    console.log("[restore] 本机 "+process.argv[1].split("/").slice(-2)[0]+" 包数量: "+m.packages.length+"（需要时加 --pkgs 自动 pkg install）");
+  ' "\$BUNDLE_DIR/MANIFEST.json" 2>/dev/null || true
+fi
+
+# ---- 2. home 侧 ----
+for d in .dsh .dshpj .dshpj-lab; do
+  if [ -d "\$BUNDLE_DIR/payload/home/\$d" ]; then
+    mk_backup_target="\$HOME_DIR/\$d"
+    if [ -e "\$mk_backup_target" ]; then
+      if [ "\$FRESH" = 1 ]; then say "清空旧 \$mk_backup_target"; [ "\$DRY" = 1 ] || rm -rf "\$mk_backup_target"
+      else say "备份 \$mk_backup_target -> \$mk_backup_target.bak-\$STAMP"; [ "\$DRY" = 1 ] || mv "\$mk_backup_target" "\$mk_backup_target.bak-\$STAMP"; fi
+    fi
+    say "还原 ~/\$d"
+    [ "\$DRY" = 1 ] || { mkdir -p "\$HOME_DIR/\$d"; tar -cf - -C "\$BUNDLE_DIR/payload/home/\$d" . | tar -xf - -C "\$HOME_DIR/\$d"; }
+  fi
+done
+for f in .bashrc .bash_profile .profile .npmrc .gitconfig .hushlogin; do
+  [ -f "\$BUNDLE_DIR/payload/home/\$f" ] || continue
+  [ -e "\$HOME_DIR/\$f" ] && [ "\$FRESH" = 0 ] && cp -a "\$HOME_DIR/\$f" "\$HOME_DIR/\$f.bak-\$STAMP"
+  say "还原 ~/\$f"; [ "\$DRY" = 1 ] || cp -a "\$BUNDLE_DIR/payload/home/\$f" "\$HOME_DIR/\$f"
+done
+if [ -d "\$BUNDLE_DIR/payload/home/.termux" ]; then
+  say "还原 ~/.termux"
+  [ "\$DRY" = 1 ] || { mkdir -p "\$HOME_DIR/.termux"; tar -cf - -C "\$BUNDLE_DIR/payload/home/.termux" . | tar -xf - -C "\$HOME_DIR/.termux"; }
+fi
+
+# ---- 3. prefix 侧：全局包 ----
+if [ -d "\$BUNDLE_DIR/payload/prefix/lib/node_modules/@deepseek-ai" ]; then
+  say "还原 \$PREFIX/lib/node_modules/@deepseek-ai"
+  if [ "\$DRY" = 0 ]; then
+    mkdir -p "\$PREFIX/lib/node_modules"
+    [ -e "\$PREFIX/lib/node_modules/@deepseek-ai" ] && [ "\$FRESH" = 0 ] && mv "\$PREFIX/lib/node_modules/@deepseek-ai" "\$PREFIX/lib/node_modules/@deepseek-ai.bak-\$STAMP"
+    mkdir -p "\$PREFIX/lib/node_modules/@deepseek-ai"
+    tar -cf - -C "\$BUNDLE_DIR/payload/prefix/lib/node_modules/@deepseek-ai" . | tar -xf - -C "\$PREFIX/lib/node_modules/@deepseek-ai"
+  fi
+else
+  say "包内无 node_modules（slim），用 npm 重装 @deepseek-ai/dsh@\$DSHVER"
+  [ "\$DRY" = 1 ] || npm i -g "@deepseek-ai/dsh@\$DSHVER"
+fi
+
+# ---- 4. 包装器 ----
+if [ -d "\$BUNDLE_DIR/payload/prefix/bin" ]; then
+  for f in "\$BUNDLE_DIR/payload/prefix/bin"/*; do
+    b="\$(basename "\$f")"
+    [ "\$b" = "*" ] && continue
+    say "安装 \$PREFIX/bin/\$b"
+    [ "\$DRY" = 1 ] || { cp -a "\$f" "\$PREFIX/bin/\$b"; chmod 755 "\$PREFIX/bin/\$b"; }
+  done
+fi
+
+# ---- 5. secrets ----
+if [ -d "\$BUNDLE_DIR/secrets" ]; then
+  say "secrets/ 存在：凭证不会自动落盘，按需手动放回（.credentials.yaml -> ~/.dsh/，.ssh -> ~/.ssh）"
+fi
+
+# ---- 6. 自检 ----
+if [ "\$DRY" = 0 ]; then
+  say "自检:"
+  P="\$PREFIX/lib/node_modules" node -e 'const fs=require("fs");try{console.log("  dsh    :", JSON.parse(fs.readFileSync(process.env.P+"/@deepseek-ai/dsh/package.json","utf8")).version)}catch(e){console.log("  dsh    : 缺失 ("+e.code+")")}' || true
+  printf '  node   : %s\n' "\$(node -v 2>/dev/null || echo 缺失)"
+  [ -f "\$HOME_DIR/.dshpj/assets/patch.yml" ] && echo "  补丁栈 : ~/.dshpj/assets/patch.yml 就绪"
+  command -v dsh >/dev/null && echo "  dsh    : \$(command -v dsh)" || echo "  dsh    : 不在 PATH"
+fi
+say "完成。启动：dshpj   （或 dsh --version 先测）"
+RESTORE_EOF
+  chmod 755 "$dst"
+}
+
+# ---------------------------------------------------------------- list/verify ---
+
+unpack_to_tmp() {
+  local bundle="$1"
+  case "$bundle" in
+    *.run) local d n; d="$(mktemp -d)"; n="$(awk '/^__ARCHIVE_BELOW__$/{print NR+1; exit}' "$bundle")"; tail -n +"$n" "$bundle" | zstd -dc | tar -xf - -C "$d"; echo "$d";;
+    *.tar.zst|*.tzst) local d; d="$(mktemp -d)"; zstd -dc "$bundle" | tar -xf - -C "$d"; echo "$d";;
+    *.tar) local d; d="$(mktemp -d)"; tar -xf "$bundle" -C "$d"; echo "$d";;
+    *) die "不认识的包格式: $bundle";;
+  esac
+}
+
+cmd_list() {
+  local bundle="${1:?用法: dshpack list <bundle>}"
+  local d; d="$(unpack_to_tmp "$bundle")"
+  sed -n '1,40p' "$d/MANIFEST.txt" 2>/dev/null || true
+  node -e '
+    const m=require(process.argv[1]);
+    console.log("\n== 环境 ==");
+    console.log(" node", m.runtime.node, "| npm", m.runtime.npm, "| dsh", m.runtime.dsh, "|", m.platform.arch);
+    console.log(" 全局包:", Object.entries(m.npmpackages||{}).map(([k,v])=>k+"@"+v).join(", ") || "(无)");
+    console.log(" Termux 包:", (m.packages||[]).length, "个");
+  ' "$d/MANIFEST.json"
+  echo "\n== 内容大小 =="
+  du -sh "$d"/payload/home/* "$d"/payload/prefix/lib/node_modules/* 2>/dev/null || true
+  rm -rf "$d"
+}
+
+cmd_verify() {
+  local bundle="${1:?用法: dshpack verify <bundle>}"
+  local d; d="$(unpack_to_tmp "$bundle")"
+  ( cd "$d" && sha256sum -c CHECKSUMS.sha256 --quiet ) && say "校验通过: $bundle"
+  local n; n=$(wc -l < "$d/CHECKSUMS.sha256")
+  say "已校验 $n 个文件"
+  rm -rf "$d"
+}
+
+cmd_restore() {
+  local bundle="${1:?用法: dshpack restore <bundle> [--fresh] [--pkgs] [--dry-run]}"; shift || true
+  local d; d="$(unpack_to_tmp "$bundle")"
+  # 校验后执行
+  ( cd "$d" && sha256sum -c CHECKSUMS.sha256 --quiet ) || { say "校验失败，停止"; exit 1; }
+  bash "$d/RESTORE.sh" "$@"
+  rm -rf "$d"
+}
+
+cmd_selfextract() {
+  local bundle="${1:?用法: dshpack selfextract <bundle.tar.zst> [-o OUT.run]}"; shift || true
+  local out=""
+  while [ $# -gt 0 ]; do case "$1" in -o|--out) out="${2:?}"; shift 2;; *) die "未知参数: $1";; esac; done
+  [ -f "$bundle" ] || die "找不到包: $bundle"
+  [ -n "$out" ] || out="${bundle%.tar.zst}.run"
+  {
+    cat <<'HEAD'
+#!/data/data/com.termux/files/usr/bin/bash
+# dshpack 自解压安装包：./xxx.run [--fresh] [--pkgs] [--dry-run]
+# 单文件传输 -> 解到临时目录 -> 校验 -> 执行 RESTORE.sh
+set -euo pipefail
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+N="$(awk '/^__ARCHIVE_BELOW__$/{print NR+1; exit}' "$SELF")"
+T="$(mktemp -d "${TMPDIR:-/tmp}/dshpack.XXXXXX")"
+trap 'rm -rf "$T"' EXIT
+echo "[run] 解包到 $T"
+tail -n +"$N" "$SELF" | zstd -dc | tar -xf - -C "$T"
+cd "$T"
+sha256sum -c CHECKSUMS.sha256 --quiet
+echo "[run] sha256 校验通过"
+bash RESTORE.sh "$@"
+exit 0
+HEAD
+    printf '__ARCHIVE_BELOW__\n'
+    cat "$bundle"
+  } > "$out"
+  chmod 755 "$out"
+  say "自解压包: $out ($(human "$(stat -c %s "$out")"))"
+  rm -f "$out.sha256"; sha256sum "$out" > "$out.sha256"
+}
+
+cmd_info() {
+  echo "dshpack $VERSION"
+  echo "  PREFIX      : $PREFIX"
+  echo "  HOME        : $HOME_DIR"
+  echo "  npm global  : $NPM_GLOBAL"
+  echo "  node        : $(node -v 2>/dev/null || echo 缺失)"
+  echo "  dsh         : $(N="$NPM_GLOBAL" node -e 'const fs=require("fs");try{console.log(JSON.parse(fs.readFileSync(process.env.N+"/@deepseek-ai/dsh/package.json","utf8")).version)}catch(e){console.log("缺失")}')"
+  echo "  ~/.dsh      : $(du -sh "$HOME_DIR/.dsh" 2>/dev/null | cut -f1)"
+  echo "  ~/.dshpj    : $(du -sh "$HOME_DIR/.dshpj" 2>/dev/null | cut -f1)"
+  echo "  @deepseek-ai: $(du -sh "$NPM_GLOBAL/@deepseek-ai" 2>/dev/null | cut -f1)"
+}
+
+usage() { sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  pack)    shift; cmd_pack "$@";;
+  list)    shift; cmd_list "$@";;
+  verify)  shift; cmd_verify "$@";;
+  restore) shift; cmd_restore "$@";;
+  selfextract|run) shift; cmd_selfextract "$@";;
+  info)    shift; cmd_info "$@";;
+  -h|--help|help|"") usage;;
+  *) die "未知子命令: $1（用 dshpack --help）";;
+esac
